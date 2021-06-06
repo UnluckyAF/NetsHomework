@@ -11,7 +11,7 @@ import threading
 import traceback
 
 
-BUF_SIZE=1024
+BUF_SIZE=4096
 TIMEOUT = 1
 
 
@@ -21,67 +21,148 @@ class UDPWithExtraStepsClient():
         self.timeout = timeout
         self.host = host
         self.port = port
-        logging.info("set socket")
+        logging.info("set socket\n")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq = 0
-        self.queue = queue.Queue()
+        self.retry_queue = queue.Queue()
+        self.ack_queue = queue.PriorityQueue()
+        self._stop = threading.Event()
+        self.retrier = None
+        self.receiver = None
 
 
-    def create_packet(self, data):
+    def handshake(self):
+        logging.info("setting connection")
+        packet = self.create_packet("HSH", self.seq)
+        encoded_packet = packet.encode("utf-8")
+        logging.info("send handshake")
+        num = self.sock.sendto(encoded_packet, (self.host, self.port))
+        self.sock.setblocking(False)
+        logging.info("sended handshake")
+        timeout = self.timeout
+
+        while True:
+            sleep(timeout)
+            logging.info("recv handshake")
+            #TODO
+            ack = self.sock.recv(BUF_SIZE)
+            logging.info("recved handshake")
+            data = ack.decode("utf-8")
+            packet = json.loads(data)
+            seq = packet['seq']
+            if self.seq == seq:
+                break
+            logging.info("send handshake")
+            num = self.sock.sendto(encoded_packet, (self.host, self.port))
+            logging.info("sended handshake")
+            timeout += 1
+            if timeout > 10:
+                timeout = 10
+            logging.warning("retry with %d s timeout\n", timeout)
+        logging.info("connection set")
+        self.sock.setblocking(True)
+
+
+    def start(self):
+        self.handshake()
+        self.retrier = threading.Thread(target=self.retry)
+        self.receiver = threading.Thread(target=self.receive_ack)
+        self.retrier.start()
+        self.receiver.start()
+
+
+    def create_packet(self, data, seq):
         packet = {
                 'data': data,
-                'seq': self.seq
+                'seq': seq
                 }
+        packet['csum'] = sys.getsizeof(packet)
         return json.dumps(packet)
 
 
-    def receive_ack(self, seq, success):
-        ack, address = self.sock.recvfrom(BUF_SIZE)
-        host, port = address
-        data = ack.decode("utf-8")
-        packet = json.loads(data)
-        success = seq == packet['seq']
-        print(success, seq, packet['seq'])
+    def receive_ack(self):
+        while not self._stop.is_set():
+            ack = self.sock.recv(BUF_SIZE)
+            #host, port = address
+            data = ack.decode("utf-8")
+            packet = json.loads(data)
+            self.ack_queue.put(packet['seq'])
+        #success = seq == packet['seq']
+        #print(success, seq, packet['seq'])
 
 
-    def receive_ack_with_timeout(self, seq, timeout):
-        fl = False
-        thread = threading.Thread(target=self.receive_ack, args=(seq, fl))
-        logging.info("waiting for ack, seq: %d", seq)
-        thread.start()
-        thread.join(timeout)
-        print(fl)
-        return fl
+    #def receive_ack_with_timeout(self, seq, timeout):
+    #    fl = False
+    #    thread = threading.Thread(target=self.receive_ack, args=(seq, fl))
+    #    logging.info("waiting for ack, seq: %d", seq)
+    #    thread.start()
+    #    thread.join(timeout)
+        #print(fl)
+        #return fl
 
 
-    def send_with_retry(self, data):
-        timeout = self.timeout
-
-        packet = self.create_packet(data)
-        packet = packet.encode('utf-8')
-        num = None
-        while True:
-            num = self.sock.sendto(packet, (self.host, self.port))
-            if self.receive_ack_with_timeout(self.seq, timeout):
-                break
-            timeout *= 2
-            if timeout > 30:
-                timeout = 30
-            logging.warn("retry with %d s timeout", timeout)
-        self.seq += 1
-        logging.info("%d bytes sent", num)
+    def get_ack(self):
+        ack = None
+        try:
+            ack = self.ack_queue.get(block=False)
+            self.ack_queue.task_done()
+        except queue.Empty:
+            ack = None
+        return ack
 
 
+    def retry(self):
+        while not self._stop.is_set():
+            timeout = self.timeout
+
+            #packet = self.create_packet(data, self.seq)
+            packet = self.retry_queue.get()
+            encoded_packet = packet.encode('utf-8')
+            packet = json.loads(packet)
+            while True:
+                sleep(timeout)
+                #if self.receive_ack_with_timeout(packet['seq'], timeout):
+                #    break
+                #self.receive_ack_with_timeout(packet['seq'], timeout)
+                ack = self.get_ack()
+                while ack is not None and ack < packet["seq"]:
+                    ack = self.get_ack()
+
+                if ack is not None:
+                    if packet['seq'] == ack:
+                        self.retry_queue.task_done()
+                        break
+                    self.ack_queue.put(ack)
+                num = self.sock.sendto(encoded_packet, (self.host, self.port))
+                timeout += 1
+                if timeout > 10:
+                    timeout = 10
+                logging.warning("retry with %d s timeout %d seq\n", timeout, packet['seq'])
+            #self.seq += 1
+
+
+    # send each batch and add seq + data to queue
     def send(self, data):
         for batch in getBatches(data, BUF_SIZE):
-            self.send_with_retry(data)
-
+            #self.send_with_retry(data)
+            #self.queue.put(self.create_packet(batch, self.seq))
+            packet = self.create_packet(batch, self.seq)
+            encoded_packet = packet.encode("utf-8")
+            num = self.sock.sendto(encoded_packet, (self.host, self.port))
+            logging.info("%d bytes sent, %d seq\n", num, self.seq)
+            self.retry_queue.put(packet)
+            self.seq += 1
 
 
     def shutdown(self):
+        self.ack_queue.join()
+        self.retry_queue.join()
+        self._stop.set()
+        self.receiver.join()
+        self.retrier.join()
         self.sock.close()
         exc = sys.exc_info()
-        logging.info("client shutdown: %s", exc)
+        logging.info("client shutdown: %s\n", exc)
         traceback.print_exception(*exc)
 
 
@@ -101,7 +182,8 @@ def getBatches(data, buf_size):
 
 def runClient(host, port, without_user):
     client = UDPWithExtraStepsClient(host, port)
-    logging.info("send messages")
+    client.start()
+    logging.info("send messages\n")
     while True:
         try:
             data = ""

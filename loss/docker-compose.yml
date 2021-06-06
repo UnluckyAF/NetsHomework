@@ -1,0 +1,23 @@
+version: "3.3"
+services:
+    client:
+        image: python
+        entrypoint: sh
+        command: -c "/client/client.py --host server -p 7000 --without_user"
+        volumes:
+            - ../client.py:/client/client.py
+            - ../poem:/client/poem
+    server:
+        image: python
+        entrypoint: sh
+        command: -c "/server.py --host server -p 7000"
+        volumes:
+            - ../server.py:/server.py
+    pumba:
+        image: gaiaadm/pumba
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+        command: "netem --duration 5m loss --percent 20 're2:.*'"
+        depends_on:
+            - client
+            - server

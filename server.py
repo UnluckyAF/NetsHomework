@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import queue
 import socket
 import sys
 import traceback
@@ -18,6 +19,7 @@ class UDPWithExtraStepsServer():
         logging.info("bind to %s:%d", host, port)
         self.sock.bind((host, port))
         self.seq = 0
+        self.seq_queue = queue.PriorityQueue()
 
 
     def create_ack_packet(self, seq):
@@ -27,22 +29,84 @@ class UDPWithExtraStepsServer():
         return json.dumps(packet)
 
 
+    def get_seq(self):
+        seq = None
+        try:
+            seq = self.seq_queue.get(block=False)
+            self.seq_queue.task_done()
+        except queue.Empty:
+            seq = None
+        return seq
+
+
+    def check_handshake(self, packet, address):
+        if packet['data'] == "HSH":
+            self.seq = packet['seq']
+            self.seq_queue = queue.PriorityQueue()
+            ack = self.create_ack_packet(packet['seq'])
+            ack = ack.encode('utf-8')
+            num = self.sock.sendto(ack, address)
+            return True
+        return False
+
+
+    def check_sum(self, packet):
+        tmp = {
+                "data": packet["data"],
+                "seq": packet["seq"]
+                }
+        if packet['csum'] != sys.getsizeof(tmp):
+            return False
+        return True
+
+
     def recv(self):
         json_data, address = self.sock.recvfrom(BUF_SIZE)
         data = json_data.decode("utf-8")
         packet = json.loads(data)
-        
+        logging.info("received %d seq", packet['seq'])
+        if self.check_handshake(packet, address):
+            return
+        if not self.check_sum(packet):
+            return
+
         ack = self.create_ack_packet(packet['seq'])
         ack = ack.encode('utf-8')
         num = self.sock.sendto(ack, address)
-        logging.info("%d bytes ack sent", num)
+        logging.info("%d bytes ack sent, %d seq", num, packet['seq'])
         if packet['seq'] == self.seq:
+            #logging.info("received %s", packet['data'])
+            logging.info("received %d seq, mes: \n%s", packet['seq'], packet['data'])
             self.seq += 1
+        elif packet['seq'] > self.seq:
+            logging.info("saved %d seq", packet['seq'])
+            self.seq_queue.put((packet['seq'], packet['data']))
+            return
+        else:
+            logging.info("received old message %d", packet['seq'])
+            return
 
-        logging.info("received %s", packet['data'])
+        seq = self.get_seq()
+        if seq is None:
+            logging.info("seq is None, seq %d", self.seq)
+        else:
+            logging.info("seq %d, self.seq %d", seq[0], self.seq)
+        while seq is not None and seq[0] < self.seq:
+            logging.info("old %d seq", seq[0])
+            seq = self.get_seq()
+        while seq is not None and seq[0] == self.seq:
+            logging.info("received %d seq, mes: \n%s", seq[0], seq[1])
+            self.seq += 1
+            while seq is not None and seq[0] < self.seq:
+                logging.info("old %d seq", seq[0])
+                seq = self.get_seq()
+        if seq is not None:
+            self.seq_queue.put(seq)
 
+        
 
     def shutdown(self):
+        self.seq_queue.join()
         self.sock.close()
         exc = sys.exc_info()
         logging.info("server shutdown: %s", exc)
