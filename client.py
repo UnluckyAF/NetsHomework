@@ -2,11 +2,87 @@
 from time import sleep
 
 import argparse
+import json
 import logging
+import queue
 import socket
 import sys
+import threading
+import traceback
+
 
 BUF_SIZE=1024
+TIMEOUT = 1
+
+
+class UDPWithExtraStepsClient():
+    def __init__(self, host, port, buf_size=BUF_SIZE, timeout=TIMEOUT):
+        self.buf_size = buf_size
+        self.timeout = timeout
+        self.host = host
+        self.port = port
+        logging.info("set socket")
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.seq = 0
+        self.queue = queue.Queue()
+
+
+    def create_packet(self, data):
+        packet = {
+                'data': data,
+                'seq': self.seq
+                }
+        return json.dumps(packet)
+
+
+    def receive_ack(self, seq, success):
+        ack, address = self.sock.recvfrom(BUF_SIZE)
+        host, port = address
+        data = ack.decode("utf-8")
+        packet = json.loads(data)
+        success = seq == packet['seq']
+        print(success, seq, packet['seq'])
+
+
+    def receive_ack_with_timeout(self, seq, timeout):
+        fl = False
+        thread = threading.Thread(target=self.receive_ack, args=(seq, fl))
+        logging.info("waiting for ack, seq: %d", seq)
+        thread.start()
+        thread.join(timeout)
+        print(fl)
+        return fl
+
+
+    def send_with_retry(self, data):
+        timeout = self.timeout
+
+        packet = self.create_packet(data)
+        packet = packet.encode('utf-8')
+        num = None
+        while True:
+            num = self.sock.sendto(packet, (self.host, self.port))
+            if self.receive_ack_with_timeout(self.seq, timeout):
+                break
+            timeout *= 2
+            if timeout > 30:
+                timeout = 30
+            logging.warn("retry with %d s timeout", timeout)
+        self.seq += 1
+        logging.info("%d bytes sent", num)
+
+
+    def send(self, data):
+        for batch in getBatches(data, BUF_SIZE):
+            self.send_with_retry(data)
+
+
+
+    def shutdown(self):
+        self.sock.close()
+        exc = sys.exc_info()
+        logging.info("client shutdown: %s", exc)
+        traceback.print_exception(*exc)
 
 
 def getBatches(data, buf_size):
@@ -24,9 +100,7 @@ def getBatches(data, buf_size):
 
 
 def runClient(host, port, without_user):
-    logging.info("set socket")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
+    client = UDPWithExtraStepsClient(host, port)
     logging.info("send messages")
     while True:
         try:
@@ -38,14 +112,9 @@ def runClient(host, port, without_user):
                 sleep(5)
             else:
                 data = input("Your message: ")
-
-            for batch in getBatches(data, BUF_SIZE):
-                batch = batch.encode('utf-8')
-                num = sock.sendto(batch, (host, port))
-                logging.info("%d bytes sent", num)
+            client.send(data)
         except:
-            sock.close()
-            logging.info("client shutdown: %s", sys.exc_info())
+            client.shutdown()
             return
 
 
